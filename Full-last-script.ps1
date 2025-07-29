@@ -1,4 +1,4 @@
-<# --- CONFIG --- #>
+# --- CONFIG --- #
 $appNamesToMatch = @("WhatsApp", "Telegram", "Instagram", "Twitter", "Firefox")    # Target apps
 $bundleExtensions = @("*.msixbundle")  # App bundles to delete
 $allowedAppExtensions = @("*.exe", "*.dll", "*.bin", "*.pdb", "*.pak", "unins000.exe") # Only delete these extensions
@@ -8,10 +8,29 @@ $searchPaths = (Get-PSDrive -PSProvider FileSystem).Root  # All drives (C:\, D:\
 # Timestamp function
 function Get-Timestamp { return Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
 
+# Show Policy Violation Alert
+function Show-PolicyAlert {
+    Add-Type -AssemblyName PresentationFramework
+    $alertScript = {
+        Add-Type -AssemblyName PresentationFramework
+        [System.Windows.MessageBox]::Show("Unauthorized software has been detected on this device. This is a serious violation of company policy and has been reported to the IT Department.", "Policy Violation Detected", "OK", "Warning")
+    }
+    Start-Job $alertScript | Out-Null
+}
+
+# Logging
+function Write-PolicyLog {
+    $logFolder = "C:\CompanyLogs"
+    $logFile = "$logFolder\policy_violations.log"
+    if (!(Test-Path $logFolder)) { New-Item -ItemType Directory -Path $logFolder -Force | Out-Null }
+    $timestamp = Get-Timestamp
+    Add-Content -Path $logFile -Value "[$timestamp] $($args[0])"
+}
+
 # Check if process matches our target apps
 function Is-TargetAppProcess($proc, $names) {
     try {
-        $fileInfo = (Get-Item $proc.Path -ErrorAction SilentlyContinue).VersionInfo
+        $fileInfo = (Get-Item -LiteralPath $proc.Path -ErrorAction SilentlyContinue).VersionInfo
         foreach ($name in $names) {
             if ($fileInfo.ProductName -match $name -or $proc.Path -match $name) { return $true }
         }
@@ -19,33 +38,31 @@ function Is-TargetAppProcess($proc, $names) {
     return $false
 }
 
-# --- STEP 1: Handle running processes FIRST ---
+# --- STEP 1: Handle running processes ---
 Write-Host "[$(Get-Timestamp)] Scanning for running target apps..."
 $targetProcs = Get-Process | Where-Object { $_.Path -and (Is-TargetAppProcess $_ $appNamesToMatch) } -ErrorAction SilentlyContinue
 
 if ($targetProcs) {
+    Show-PolicyAlert
+    Write-PolicyLog "Policy violation: Found running restricted apps."
+
     foreach ($proc in $targetProcs) {
         $appPath = $proc.Path
         $appFolder = Split-Path $appPath -Parent
-        Write-Host "[$(Get-Timestamp)] Detected target app at: $appPath"
+        Write-Host "[$(Get-Timestamp)] Detected: `"$appPath`""
+        Write-PolicyLog "Detected: $appPath"
 
-        try {
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "[$(Get-Timestamp)] Killed process: $($proc.ProcessName)"
-        } catch {
-            Write-Host "[$(Get-Timestamp)] Failed to kill process: $($proc.ProcessName)"
-        }
-
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
         Start-Sleep -Seconds 2
 
-        # Delete binaries only (no dummy files created)
         foreach ($ext in $allowedAppExtensions) {
-            Get-ChildItem -Path $appFolder -Filter $ext -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-ChildItem -LiteralPath $appFolder -Filter $ext -File -ErrorAction SilentlyContinue | ForEach-Object {
                 try {
-                    Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
-                    Write-Host "[$(Get-Timestamp)] Deleted: $($_.FullName)"
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Host "[$(Get-Timestamp)] Deleted: `"$($_.FullName)`""
+                    Write-PolicyLog "Deleted: $($_.FullName)"
                 } catch {
-                    Write-Host "[$(Get-Timestamp)] Failed to delete: $($_.FullName)"
+                    Write-Host "[$(Get-Timestamp)] Failed: `"$($_.FullName)`""
                 }
             }
         }
@@ -54,72 +71,63 @@ if ($targetProcs) {
     Write-Host "[$(Get-Timestamp)] No running target apps found."
 }
 
-
-# --- STEP 3: Remove UWP (Store) versions ---
+# --- STEP 2: Remove UWP (Store) versions ---
 foreach ($name in $appNamesToMatch) {
     try {
         $pkg = Get-AppxPackage | Where-Object { $_.Name -match $name }
         if ($pkg) {
             Write-Host "[$(Get-Timestamp)] Removing Store package: $($pkg.PackageFullName)"
+            Write-PolicyLog "Removing Store package: $($pkg.PackageFullName)"
             Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction SilentlyContinue
         }
-    } catch {
-        Write-Host "[$(Get-Timestamp)] Failed to remove package: $name"
-    }
+    } catch {}
 }
 
-# --- STEP 4: Delete matching MSIX bundles ---
+# --- STEP 3: Delete MSIX bundles ---
 Write-Host "[$(Get-Timestamp)] Scanning for target MSIX bundles..."
 $foundBundles = @()
-Get-PSDrive -PSProvider FileSystem | ForEach-Object {
-    $drive = $_.Root
+foreach ($drive in $searchPaths) {
     foreach ($ext in $bundleExtensions) {
         try {
-            $found = Get-ChildItem -Path $drive -Recurse -Include $ext -ErrorAction SilentlyContinue
-            foreach ($file in $found) {
-                $lowerName = $file.Name.ToLower()
+            Get-ChildItem -LiteralPath $drive -Recurse -Include $ext -ErrorAction SilentlyContinue | ForEach-Object {
+                $lowerName = $_.Name.ToLower()
                 if ($bundleNamePatterns | ForEach-Object { if ($lowerName -like "*$($_.ToLower())*") { return $true } }) {
-                    $foundBundles += $file
+                    $foundBundles += $_
+                    Write-Host "[$(Get-Timestamp)] Found bundle: `"$($_.FullName)`""
+                    Write-PolicyLog "Found bundle: $($_.FullName)"
                 }
             }
-        } catch {
-            Write-Host "[$(Get-Timestamp)] Error scanning $drive : $_"
-        }
+        } catch {}
     }
 }
 
-
-# --- STEP 2: Search for leftover binaries (after running apps are handled) ---
+# --- STEP 4: Delete leftover binaries ---
 Write-Host "[$(Get-Timestamp)] Searching for application files..."
 foreach ($path in $searchPaths) {
     foreach ($app in $appNamesToMatch) {
         foreach ($ext in $allowedAppExtensions) {
             try {
-                $files = Get-ChildItem -Path $path -Filter $ext -Recurse -File -ErrorAction SilentlyContinue | 
-                         Where-Object { $_.FullName -match $app }
-                foreach ($file in $files) {
+                Get-ChildItem -LiteralPath $path -Filter $ext -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match $app } | ForEach-Object {
                     try {
-                        Remove-Item -Path $file.FullName -Force -ErrorAction SilentlyContinue
-                        Write-Host "[$(Get-Timestamp)] Deleted file: $($file.FullName)"
-                    } catch {
-                        Write-Host "[$(Get-Timestamp)] Failed to delete file: $($file.FullName)"
-                    }
+                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                        Write-Host "[$(Get-Timestamp)] Deleted file: `"$($_.FullName)`""
+                        Write-PolicyLog "Deleted file: $($_.FullName)"
+                    } catch {}
                 }
-            } catch {
-                Write-Host "[$(Get-Timestamp)] Error searching in $path for $app files: $_"
-            }
+            } catch {}
         }
     }
 }
 
+# --- Delete found bundles ---
 if ($foundBundles.Count -gt 0) {
     foreach ($bundle in $foundBundles) {
         try {
-            Write-Host "[$(Get-Timestamp)] Deleting bundle: $($bundle.FullName)"
-            Remove-Item -Path $bundle.FullName -Force -ErrorAction Stop
-        } catch {
-            Write-Host "[$(Get-Timestamp)] Failed to delete bundle: $($bundle.FullName)"
-        }
+            Write-Host "[$(Get-Timestamp)] Deleting bundle: `"$($bundle.FullName)`""
+            Remove-Item -LiteralPath $bundle.FullName -Force -ErrorAction SilentlyContinue
+            Write-PolicyLog "Deleted bundle: $($bundle.FullName)"
+        } catch {}
     }
 } else {
     Write-Host "[$(Get-Timestamp)] No matching MSIX bundles found."
